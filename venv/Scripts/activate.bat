@@ -8,7 +8,7 @@ if defined _OLD_CODEPAGE (
     "%SystemRoot%\System32\chcp.com" 65001 > nul
 )
 
-set VIRTUAL_ENV=C:\Users\김범수\Documents\GitHub\MyEggBasket-SC\venv
+set VIRTUAL_ENV=C:\Users\user\Documents\Github\MyEggBasket-SC\venv
 
 if not defined PROMPT set PROMPT=$P$G
 

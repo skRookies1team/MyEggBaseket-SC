@@ -1,44 +1,50 @@
-import threading
-import time
-
-from kafka_consumer import consume_subscription_events
-from kis_ws.kis_client import KISWebSocketClient
-from kis_ws.kis_auth import get_approval_key
-
-
-def start_kafka_consumer():
-    """
-    Kafka stock-subscription 토픽을 소비해서
-    subscribe / unsubscribe 이벤트를 처리
-    """
-    consume_subscription_events()
-
+from kafka_client import create_consumer, create_producer
+from subscription_manager import SubscriptionManager
+from kis_ws_client import KISWebSocketClient
+from config import *
+import json
 
 def main():
-    print(" StockCollector started")
-
-    # 1️⃣ approval_key 자동 발급
-    approval_key = get_approval_key()
-    print(" approval_key 발급 완료")
-
-    # 2️⃣ KIS WebSocket Client 생성 및 연결
-    kis_client = KISWebSocketClient(approval_key)
-    kis_client.connect()
-
-    # 3️⃣ Kafka Consumer 스레드 시작
-    consumer_thread = threading.Thread(
-        target=start_kafka_consumer,
-        daemon=True,
+    consumer = create_consumer(
+        topic=TOPIC_SUBSCRIBE,
+        group_id=GROUP_ID,
+        servers=KAFKA_BOOTSTRAP_SERVERS,
     )
-    consumer_thread.start()
+    producer = create_producer(KAFKA_BOOTSTRAP_SERVERS)
 
-    # 4️⃣ 메인 스레드는 생존만 유지
-    try:
-        while True:
-            time.sleep(1)
-    except KeyboardInterrupt:
-        print(" StockCollector stopped")
+    sub_manager = SubscriptionManager()
 
+    def on_tick(tick):
+        producer.produce(
+            TOPIC_PUBLISH,
+            value=json.dumps(tick).encode("utf-8"),
+        )
+        producer.flush()
+        print("tick:", tick)
+
+    kis_ws = KISWebSocketClient(on_tick=on_tick)
+    kis_ws.connect()
+
+    print("StockCollector with KIS WS started")
+
+    while True:
+        msg = consumer.poll(1.0)
+        if msg is None or msg.error():
+            continue
+
+        event = json.loads(msg.value().decode("utf-8"))
+        action = event["action"]
+        symbol = event["symbol"]
+
+        if action == "SUBSCRIBE":
+            first = sub_manager.subscribe(symbol)
+            if first:
+                kis_ws.subscribe(symbol)
+
+        elif action == "UNSUBSCRIBE":
+            last = sub_manager.unsubscribe(symbol)
+            if last:
+                kis_ws.unsubscribe(symbol)
 
 if __name__ == "__main__":
     main()
