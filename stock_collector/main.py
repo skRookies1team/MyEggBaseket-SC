@@ -15,6 +15,7 @@ def main():
     sub_manager = SubscriptionManager()
 
     def on_tick(tick):
+        # 주식 데이터가 들어오면 Kafka로 재전송 & 로그 출력
         producer.produce(
             TOPIC_PUBLISH,
             value=json.dumps(tick).encode("utf-8"),
@@ -40,36 +41,38 @@ def main():
             data_str = msg.value().decode("utf-8")
             event = json.loads(data_str)
 
-            # 2. 유연한 필드 파싱 (여러 가능성 체크)
-            # action 키 찾기: action -> eventType -> type 순서
-            action = event.get("action") or event.get("eventType") or event.get("type")
+            # 2. 필드 매핑 (제공해주신 형식에 맞춤)
+            # eventType이 있으면 그걸 쓰고, 없으면 action을 찾음
+            action = event.get("eventType") or event.get("action")
 
-            # symbol 키 찾기: symbol -> code -> stockCode -> stock_code 순서
-            symbol = event.get("symbol") or event.get("code") or event.get("stockCode") or event.get("stock_code")
+            # stockCode가 있으면 그걸 쓰고, 없으면 symbol을 찾음
+            symbol = event.get("stockCode") or event.get("symbol") or event.get("code")
 
-            # 3. 필수 정보가 없으면 전체 내용 출력 후 건너뛰기
+            # 3. 데이터 검증
             if not action or not symbol:
-                print(f"⚠️ [Skip] 알 수 없는 포맷 (내용 확인 필요): {json.dumps(event, ensure_ascii=False)}")
+                print(f"⚠️ [Skip] 필수 데이터 누락: {event}")
                 continue
 
-            # 4. 구독/해제 로직 실행
-            # 대소문자 구분 없이 처리 (Subscribe, SUBSCRIBE 등)
+            # 4. 구독/해제 실행 (대소문자 무시)
             action_upper = str(action).upper()
 
             if action_upper == "SUBSCRIBE":
-                first = sub_manager.subscribe(symbol)
-                if first:
+                # 중복 구독 방지 (SubscriptionManager가 관리)
+                is_first = sub_manager.subscribe(symbol)
+                if is_first:
                     kis_ws.subscribe(symbol)
-                    print(f"✅ [구독] {symbol} (이벤트: {action})")
+                    print(f"✅ [구독] {symbol} (요청: {action})")
+                else:
+                    print(f"ℹ️ [중복] {symbol} 이미 구독 중")
 
             elif action_upper == "UNSUBSCRIBE":
-                last = sub_manager.unsubscribe(symbol)
-                if last:
+                is_last = sub_manager.unsubscribe(symbol)
+                if is_last:
                     kis_ws.unsubscribe(symbol)
-                    print(f"👋 [해제] {symbol} (이벤트: {action})")
+                    print(f"👋 [해제] {symbol} (요청: {action})")
 
             else:
-                print(f"⚠️ [Skip] 알 수 없는 명령: {action} (전체: {event})")
+                print(f"⚠️ [Skip] 알 수 없는 이벤트: {action}")
 
         except json.JSONDecodeError:
             print(f"⚠️ [Skip] JSON 파싱 실패: {msg.value()}")
