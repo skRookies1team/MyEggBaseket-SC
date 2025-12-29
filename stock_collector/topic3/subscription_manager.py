@@ -1,47 +1,54 @@
-from datetime import datetime
+from collections import deque
+
 
 class SubscriptionManager:
     def __init__(self):
-        self.subscriptions = {}
+        # 1. 관리자 계정용 (고정 50개) - 예시: 삼성전자, 하이닉스 등 주요 종목
+        self.fixed_stocks = set(["005930", "000660"])
+        # 실제로는 DB나 파일에서 상위 50개를 로드해야 합니다.
+        # self._load_top_50_stocks()
 
-    def subscribe(self, symbol: str) -> bool:
-        """
-        return True if this is FIRST subscription (need to start collecting)
-        """
-        sub = self.subscriptions.get(symbol)
+        # 2. 사용자 계정용 (관심 20개 + 조회 30개)
+        self.interest_stocks = set()  # 최대 20개
+        self.viewing_stocks = deque(maxlen=30)  # 조회용 (FIFO), 최대 30개
+        self.user_account_stocks = set()  # 실제 웹소켓에 요청할 합집합
 
-        if not sub:
-            self.subscriptions[symbol] = {
-                "count": 1,
-                "started": True,
-                "last_update": datetime.utcnow().isoformat()
-            }
-            return True  # ▶ start collection
+    def update_interest_stocks(self, stock_list):
+        """관심 종목 업데이트 (최대 20개 유지 가정)"""
+        # 리스트가 들어오면 앞 20개만 취함
+        self.interest_stocks = set(stock_list[:20])
+        return self._refresh_user_account_list()
 
-        sub["count"] += 1
-        sub["last_update"] = datetime.utcnow().isoformat()
-        return False
-
-    def unsubscribe(self, symbol: str) -> bool:
-        """
-        return True if this is LAST unsubscription (need to stop collecting)
-        """
-        sub = self.subscriptions.get(symbol)
-
-        if not sub:
+    def add_viewing_stock(self, stock_code):
+        """사용자가 조회한 종목 추가 (LRU 방식)"""
+        if not stock_code:
             return False
 
-        sub["count"] -= 1
-        sub["last_update"] = datetime.utcnow().isoformat()
+        # 1. 고정 종목에 있다면 관리자 계정에서 처리 중이므로 무시
+        if stock_code in self.fixed_stocks:
+            return False
 
-        if sub["count"] <= 0:
-            del self.subscriptions[symbol]
-            return True  # ▶ stop collection
+            # 2. 이미 조회 목록에 있다면 최신으로 갱신 (지웠다 다시 추가)
+        if stock_code in self.viewing_stocks:
+            self.viewing_stocks.remove(stock_code)
 
+        # 3. 큐에 추가 (꽉 찼다면 가장 오래된 것이 자동으로 밀려남)
+        self.viewing_stocks.append(stock_code)
+
+        return self._refresh_user_account_list()
+
+    def _refresh_user_account_list(self):
+        """관심 종목 + 조회 종목 합쳐서 사용자 계정 구독 리스트 생성"""
+        new_set = self.interest_stocks.union(set(self.viewing_stocks))
+
+        # 변경사항이 있을 때만 True 반환
+        if new_set != self.user_account_stocks:
+            self.user_account_stocks = new_set
+            return True
         return False
 
-    def is_active(self, symbol: str) -> bool:
-        return symbol in self.subscriptions
+    def get_fixed_list(self):
+        return list(self.fixed_stocks)
 
-    def snapshot(self):
-        return self.subscriptions.copy()
+    def get_user_dynamic_list(self):
+        return list(self.user_account_stocks)

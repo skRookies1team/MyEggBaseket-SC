@@ -4,10 +4,10 @@ import threading
 import websocket
 import requests
 import os
+from datetime import datetime
 from dotenv import load_dotenv
 
 load_dotenv()
-
 
 class KISWebSocketClient:
     def __init__(self, on_message):
@@ -24,7 +24,11 @@ class KISWebSocketClient:
         self.connected = False
         self.subscribed = set()
 
-        self.rest_base_url = "https://openapi.koreainvestment.com:9443"
+        # 실전/모의투자에 따른 REST URL 설정
+        if "tryitout" in self.ws_url:
+            self.rest_base_url = "https://openapivts.koreainvestment.com:29443"
+        else:
+            self.rest_base_url = "https://openapi.koreainvestment.com:9443"
 
         # 처리할 TR ID
         self.TR_TICK = "H0STCNT0"
@@ -41,11 +45,18 @@ class KISWebSocketClient:
             "secretkey": self.app_secret,
         }
 
-        res = requests.post(url, json=payload)
-        res.raise_for_status()
+        # SSL 에러 방지 (verify=False)
+        import urllib3
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-        self.approval_key = res.json()["approval_key"]
-        print("🔑 Approval Key issued")
+        try:
+            res = requests.post(url, json=payload, verify=False)
+            res.raise_for_status()
+            self.approval_key = res.json()["approval_key"]
+            print("🔑 Approval Key issued")
+        except Exception as e:
+            print(f"❌ Approval Key 발급 실패: {e}")
+            raise
 
     # -------------------------------
     # WebSocket
@@ -55,6 +66,7 @@ class KISWebSocketClient:
             self.issue_approval_key()
 
         def _run():
+            # websocket-client 라이브러리 사용
             self.ws = websocket.WebSocketApp(
                 self.ws_url,
                 on_open=self._on_open,
@@ -84,13 +96,15 @@ class KISWebSocketClient:
         print("WS error:", error)
 
     # -------------------------------
-    # Message
+    # Message Parsing (여기가 핵심!)
     # -------------------------------
     def _on_message(self, ws, message):
-        if message.startswith("{"):
+        # 1. 핑퐁 메시지나 이상한 데이터 무시
+        if message.startswith("{") or "|" not in message:
             return
 
         parts = message.split("|")
+        # TR ID 확인 (H0STCNT0 등)
         if len(parts) < 4:
             return
 
