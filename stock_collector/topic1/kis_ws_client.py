@@ -8,23 +8,27 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+
 class KISWebSocketClient:
-    def __init__(self, on_tick):
+    def __init__(self, on_message):
         self.app_key = os.getenv("KIS_APP_KEY")
         self.app_secret = os.getenv("KIS_APP_SECRET")
         self.ws_url = os.getenv("KIS_WS_URL")
-        self.tr_id = os.getenv("KIS_TR_ID", "H0STCNT0")
 
         if not self.app_key or not self.app_secret:
             raise RuntimeError("KIS_APP_KEY / KIS_APP_SECRET missing")
 
-        self.on_tick = on_tick
+        self.on_message = on_message
         self.approval_key = None
         self.ws = None
         self.connected = False
         self.subscribed = set()
 
         self.rest_base_url = "https://openapi.koreainvestment.com:9443"
+
+        # 처리할 TR ID
+        self.TR_TICK = "H0STCNT0"
+        self.TR_ORDERBOOK = "H0STASP0"
 
     # -------------------------------
     # Approval Key
@@ -67,7 +71,8 @@ class KISWebSocketClient:
         print("🔌 KIS WebSocket connected")
 
         for symbol in self.subscribed:
-            self._send_subscribe(symbol)
+            self._send_subscribe(symbol, self.TR_TICK)
+            self._send_subscribe(symbol, self.TR_ORDERBOOK)
 
     def _on_close(self, ws, *args):
         self.connected = False
@@ -86,9 +91,10 @@ class KISWebSocketClient:
             return
 
         parts = message.split("|")
-        if len(parts) < 4 or parts[1] != self.tr_id:
+        if len(parts) < 4:
             return
 
+        tr_id = parts[1]
         fields = parts[3].split("^")
         symbol = fields[0]
 
@@ -96,42 +102,54 @@ class KISWebSocketClient:
             return
 
         try:
-            tick = {
-                # 기본 식별 / 시간
-                "stckShrnIscd": fields[0],          # 종목코드
-                "stckCntgHour": fields[1],          # 체결시각 (HHMMSS)
+            # =========================
+            # 1️⃣ 실시간 체결가
+            # =========================
+            if tr_id == self.TR_TICK:
+                tick = {
+                    "type": "STOCK_TICK",
+                    "stckShrnIscd": fields[0],
+                    "stckCntgHour": fields[1],
+                    "stckPrpr": int(float(fields[2])),
+                }
+                self.on_message(tick)
 
-                # 가격 정보
-                "stckPrpr": int(float(fields[2])),  # 현재가
-                "prdyVrss": float(fields[4]),       # 전일대비
-                "prdyCtrt": float(fields[5]),       # 등락률
+            # =========================
+            # 2️⃣ 실시간 호가
+            # =========================
+            elif tr_id == self.TR_ORDERBOOK:
+                asks = []
+                bids = []
 
-                # 누적 거래
-                "acmlVol": int(float(fields[9])),   # 누적거래량
-                "acmlTrPbmn": int(float(fields[10])),  # 누적거래대금
+                # 매도호가 1~10 / 잔량
+                for i in range(10):
+                    asks.append({
+                        "price": int(float(fields[3 + i])),
+                        "qty": int(float(fields[23 + i])),
+                    })
 
-                # 호가 정보
-                "askp1": int(float(fields[13])),    # 매도1호가
-                "bidp1": int(float(fields[14])),    # 매수1호가
+                # 매수호가 1~10 / 잔량
+                for i in range(10):
+                    bids.append({
+                        "price": int(float(fields[13 + i])),
+                        "qty": int(float(fields[33 + i])),
+                    })
 
-                # 파생 지표
-                "wghtAvrgPrc": float(fields[18]),   # 가중평균체결가
+                order_book = {
+                    "type": "ORDER_BOOK",
+                    "code": symbol,
+                    "time": fields[1],
+                    "asks": asks,
+                    "bids": bids,
+                    "totalAskQty": int(float(fields[43])),
+                    "totalBidQty": int(float(fields[44])),
+                }
 
-                # 체결 수
-                "selnCntgCsnu": int(float(fields[21])),  # 매도체결건수
-                "shnuCntgCsnu": int(float(fields[22])),  # 매수체결건수
-
-                # 잔량
-                "totalAskpRsqn": int(float(fields[23])), # 총매도잔량
-                "totalBidpRsqn": int(float(fields[24])), # 총매수잔량
-            }
-
-            self.on_tick(tick)
+                self.on_message(order_book)
 
         except Exception as e:
-            print("❌ 체결 데이터 파싱 오류:", e)
-            print("원본 fields:", fields)
-
+            print("❌ 실시간 데이터 파싱 오류:", e)
+            print("원본 message:", message)
 
     # -------------------------------
     # Subscribe
@@ -143,9 +161,10 @@ class KISWebSocketClient:
         self.subscribed.add(symbol)
 
         if self.connected:
-            self._send_subscribe(symbol)
+            self._send_subscribe(symbol, self.TR_TICK)
+            self._send_subscribe(symbol, self.TR_ORDERBOOK)
 
-    def _send_subscribe(self, symbol: str):
+    def _send_subscribe(self, symbol: str, tr_id: str):
         payload = {
             "header": {
                 "approval_key": self.approval_key,
@@ -155,7 +174,7 @@ class KISWebSocketClient:
             },
             "body": {
                 "input": {
-                    "tr_id": self.tr_id,
+                    "tr_id": tr_id,
                     "tr_key": symbol,
                 }
             },
