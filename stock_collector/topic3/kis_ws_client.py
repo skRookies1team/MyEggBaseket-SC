@@ -5,22 +5,27 @@ import websocket
 import requests
 import asyncio
 import os
+import logging
 from dotenv import load_dotenv
 
-load_dotenv()
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ENV_PATH = os.path.join(BASE_DIR, ".env")
+load_dotenv(ENV_PATH)
+
+if not os.getenv("KIS_APP_KEY"):
+    load_dotenv()
 
 
 class KisWSClient:
     def __init__(self, app_key, app_secret, approval_key=None, mode="REAL"):
-        """
-        main.py의 호출 방식에 맞춘 초기화 메서드
-        """
-        self.app_key = app_key
-        self.app_secret = app_secret
+        self.app_key = app_key or os.getenv("KIS_APP_KEY")
+        self.app_secret = app_secret or os.getenv("KIS_APP_SECRET")
         self.approval_key = approval_key
         self.mode = mode
 
-        # 모드에 따른 URL 설정
         if self.mode == "REAL":
             self.rest_base_url = "https://openapi.koreainvestment.com:9443"
             self.ws_url = "ws://ops.koreainvestment.com:21000"
@@ -31,9 +36,13 @@ class KisWSClient:
         self.ws = None
         self.connected = False
         self.subscribed: set[str] = set()
+        self.on_tick = None
 
-        # 틱 데이터 처리 콜백 (기본값: 콘솔 출력)
-        self.on_tick = lambda t: print(f"[TICK] {t['stckShrnIscd']} : {t['stckPrpr']}")
+        # [핵심 수정] 메인 스레드의 이벤트 루프를 저장해둠
+        try:
+            self.loop = asyncio.get_running_loop()
+        except RuntimeError:
+            self.loop = None
 
     def issue_approval_key(self):
         url = f"{self.rest_base_url}/oauth2/Approval"
@@ -43,25 +52,39 @@ class KisWSClient:
             "appkey": self.app_key,
             "secretkey": self.app_secret,
         }
-
         try:
-            res = requests.post(url, headers=headers, data=json.dumps(payload))
-            if res.status_code != 200:
-                print(f"Approval Key 발급 실패 (Status {res.status_code}): {res.text}")
-                return
-
-            self.approval_key = res.json()["approval_key"]
-            print(f"🔑 Approval Key 발급 완료 ({self.mode})")
+            res = requests.post(url, headers=headers, data=json.dumps(payload), timeout=10)
+            if res.status_code == 200:
+                self.approval_key = res.json()["approval_key"]
+                logger.info(f"🔑 Approval Key 발급 완료 ({self.mode})")
+                return True
+            else:
+                logger.error(f"Approval Key 발급 실패: {res.text}")
+                return False
         except Exception as e:
-            print(f"Approval Key 요청 중 오류 발생: {e}")
+            logger.error(f"Approval Key Error: {e}")
+            return False
 
-    # ------------------------------------------------------------------
-    # Async Wrapper Methods (main.py 호환용)
-    # ------------------------------------------------------------------
     async def connect(self):
-        if not self.approval_key:
-            self.issue_approval_key()
+        # 루프가 변경되었을 수 있으므로 갱신
+        self.loop = asyncio.get_running_loop()
 
+        while not self.approval_key:
+            if self.issue_approval_key():
+                break
+            logger.warning("키 발급 실패.. 3초 후 재시도")
+            await asyncio.sleep(3)
+
+        self._start_ws_thread()
+
+        for _ in range(100):
+            if self.connected:
+                logger.info("✅ WebSocket Connected!")
+                return
+            await asyncio.sleep(0.1)
+        logger.error("⚠️ Connection timeout")
+
+    def _start_ws_thread(self):
         def _run():
             self.ws = websocket.WebSocketApp(
                 self.ws_url,
@@ -70,108 +93,101 @@ class KisWSClient:
                 on_error=self._on_error,
                 on_close=self._on_close,
             )
-            self.ws.run_forever()
+            self.ws.run_forever(ping_interval=30, ping_timeout=10)
 
-        # 웹소켓 스레드 시작
-        threading.Thread(target=_run, daemon=True).start()
-
-        # 연결될 때까지 대기
-        print("Connecting to KIS WebSocket...")
-        for _ in range(50):  # 최대 5초 대기
-            if self.connected:
-                print("✅ Connected!")
-                return
-            await asyncio.sleep(0.1)
-        print("⚠️ WebSocket connection might be delayed.")
+        t = threading.Thread(target=_run, daemon=True)
+        t.start()
 
     async def subscribe_list(self, symbol_list):
-        """리스트 형태의 종목들을 한 번에 구독"""
         for symbol in symbol_list:
-            self.subscribe(symbol)
-            # API 부하 방지를 위해 미세한 딜레이 (선택사항)
-            # await asyncio.sleep(0.01)
+            await self.subscribe(symbol)
 
     async def close(self):
         if self.ws:
             self.ws.close()
         self.connected = False
 
-    # ------------------------------------------------------------------
-    # WebSocket Event Handlers
-    # ------------------------------------------------------------------
+    # -----------------------------------------------------------
+    # WebSocket Callbacks (별도 스레드에서 실행됨)
+    # -----------------------------------------------------------
     def _on_open(self, ws):
         self.connected = True
-        print(f"🔌 KIS WebSocket connected ({self.mode})")
-        # 재연결 시 기존 구독 복구
-        for symbol in self.subscribed:
-            self._send_subscribe(symbol)
+        logger.info(f"🔌 KIS WebSocket connected ({self.mode})")
+        if self.subscribed:
+            logger.info(f"Resubscribing {len(self.subscribed)} symbols...")
+            for symbol in self.subscribed:
+                self._send_subscribe(symbol)
+                time.sleep(0.05)
 
-    def _on_close(self, ws, *args):
+    def _on_close(self, ws, close_status_code, close_msg):
         self.connected = False
-        print("KIS WebSocket closed")
-        # 자동 재연결 로직은 connect() 호출자가 관리하거나 여기서 처리
+        logger.warning(f"⚠️ KIS WebSocket closed ({self.mode})")
+
+        # [핵심 수정] 메인 루프에게 "재연결 함수 좀 실행해줘"라고 안전하게 부탁함
+        if self.loop and not self.loop.is_closed():
+            asyncio.run_coroutine_threadsafe(self._attempt_reconnect(), self.loop)
 
     def _on_error(self, ws, error):
-        print("KIS WebSocket error:", error)
+        logger.error(f"KIS WebSocket error: {error}")
 
     def _on_message(self, ws, message):
-        if message.startswith("{"):  # 핑퐁 메시지 등 무시
-            return
-
-        parts = message.split("|")
-        if len(parts) < 4:
-            return
-
-        # H0STCNT0: 실시간 주식 체결가
-        if parts[1] != "H0STCNT0":
-            return
-
-        f = parts[3].split("^")
-        symbol = f[0]
-
         try:
-            tick = {
-                "stckShrnIscd": f[0],  # 종목코드
-                "stckCntgHour": f[1],  # 체결시간
-                "stckPrpr": self.to_int(f[2]),  # 현재가
-                "prdyVrss": self.to_float(f[4]),  # 전일대비
-                "prdyCtrt": self.to_float(f[5]),  # 등락률
-                "acmlVol": self.to_int(f[9]),  # 누적거래량
-                "acmlTrPbmn": self.to_int(f[10]),  # 누적거래대금
-                "askp1": self.to_int(f[13]),  # 매도호가1
-                "bidp1": self.to_int(f[14]),  # 매수호가1
-            }
+            if message.startswith("{"): return
 
-            # 콜백 호출
-            if self.on_tick:
-                self.on_tick(tick)
+            parts = message.split("|")
+            if len(parts) < 4: return
+
+            tr_id = parts[1]
+            data_part = parts[3]
+            f = data_part.split("^")
+
+            data = None
+            if tr_id == "H0STCNT0":
+                data = {
+                    "type": "STOCK_TICK",
+                    "stockCode": f[0],
+                    "time": f[1],
+                    "currentPrice": self.to_int(f[2]),
+                    "changeRate": self.to_float(f[5]),
+                    "volume": self.to_int(f[9])
+                }
+            elif tr_id == "H0STASP0":
+                data = {
+                    "type": "ORDER_BOOK",
+                    "stockCode": f[0],
+                    "time": f[1],
+                    "totalAskQty": self.to_int(f[13]),
+                    "totalBidQty": self.to_int(f[14]),
+                    "asks": [{"price": self.to_int(f[i]), "qty": self.to_int(f[i + 20])} for i in range(3, 13)],
+                    "bids": [{"price": self.to_int(f[i]), "qty": self.to_int(f[i + 20])} for i in range(13, 23)]
+                }
+
+            if data and self.on_tick:
+                self.on_tick(data)
 
         except Exception as e:
-            # print("체결 데이터 파싱 오류:", e)
-            pass
+            logger.error(f"Message parse error: {e}")
 
-    # ------------------------------------------------------------------
-    # 구독 로직
-    # ------------------------------------------------------------------
-    def subscribe(self, symbol):
+    # -----------------------------------------------------------
+    # Methods
+    # -----------------------------------------------------------
+    async def subscribe(self, symbol):
         if not symbol: return
-        if symbol in self.subscribed: return
-
+        is_new = symbol not in self.subscribed
         self.subscribed.add(symbol)
+
         if self.connected:
             self._send_subscribe(symbol)
-            print(f"📡 Subscribed: {symbol}")
-
-    def unsubscribe(self, symbol):
-        if symbol not in self.subscribed: return
-        self.subscribed.remove(symbol)
-        # KIS 웹소켓은 명시적 구독 취소 API가 제한적이므로 내부 관리만 수행
-        print(f"Unsubscribed: {symbol}")
+            if is_new:
+                logger.info(f"📡 Subscribed: {symbol}")
+            await asyncio.sleep(0.05)
 
     def _send_subscribe(self, symbol):
-        if not self.approval_key:
-            return
+        if not self.approval_key: return
+        self._send_json("H0STCNT0", symbol)
+        self._send_json("H0STASP0", symbol)
 
+    def _send_json(self, tr_id, symbol):
         payload = {
             "header": {
                 "approval_key": self.approval_key,
@@ -179,17 +195,19 @@ class KisWSClient:
                 "tr_type": "1",
                 "content-type": "utf-8",
             },
-            "body": {
-                "input": {
-                    "tr_id": "H0STCNT0",
-                    "tr_key": symbol,
-                }
-            },
+            "body": {"input": {"tr_id": tr_id, "tr_key": symbol}}
         }
         try:
-            self.ws.send(json.dumps(payload))
+            if self.ws and self.ws.sock and self.ws.sock.connected:
+                self.ws.send(json.dumps(payload))
         except Exception as e:
-            print(f"Send Error: {e}")
+            logger.error(f"Send Error: {e}")
+
+    async def _attempt_reconnect(self):
+        logger.info("🔄 Reconnecting in 3s...")
+        await asyncio.sleep(3)
+        if not self.connected:
+            self._start_ws_thread()
 
     @staticmethod
     def to_int(v):

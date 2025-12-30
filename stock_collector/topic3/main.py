@@ -3,10 +3,9 @@ import asyncio
 import json
 from datetime import datetime
 from kis_ws_client import KisWSClient
-from kafka_client import KafkaConsumerClient, KafkaProducerClient  # KafkaProducerClient 필요
+from kafka_client import KafkaConsumerClient, KafkaProducerClient
 from subscription_manager import SubscriptionManager
 
-# Load .env
 try:
     from dotenv import load_dotenv
 
@@ -14,62 +13,67 @@ try:
 except Exception:
     pass
 
-APP_KEY = os.getenv("APP_KEY")
-APP_SECRET = os.getenv("APP_SECRET")
-APP_KEY_2 = os.getenv("APP_KEY_2")
-APP_SECRET_2 = os.getenv("APP_SECRET_2")
-KAFKA_BROKER = os.getenv("KAFKA_BROKER")
+# 환경변수 로드
+KAFKA_BROKER = os.getenv("KAFKA_BROKER", os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:19092"))
 
-_missing = [name for name, val in (
-    ("APP_KEY", APP_KEY),
-    ("APP_SECRET", APP_SECRET),
-    ("APP_KEY_2", APP_KEY_2),
-    ("APP_SECRET_2", APP_SECRET_2),
-    ("KAFKA_BROKER", KAFKA_BROKER),
-) if not val]
+# [계정 1] 관리자용 (고정 50개 담당)
+APP_KEY_1 = os.getenv("APP_KEY") or os.getenv("KIS_APP_KEY")
+APP_SECRET_1 = os.getenv("APP_SECRET") or os.getenv("KIS_APP_SECRET")
 
-if _missing:
-    print(f"Warning: Missing env vars: {', '.join(_missing)}")
+# [계정 2] 사용자용 (나머지 동적 구독 담당)
+APP_KEY_2 = os.getenv("APP_KEY_2") or os.getenv("KIS_APP_KEY_2") or os.getenv("KIS_APP_KEY2")
+APP_SECRET_2 = os.getenv("APP_SECRET_2") or os.getenv("KIS_APP_SECRET_2") or os.getenv("KIS_APP_SECRET2")
+
+if not APP_KEY_1 or not APP_KEY_2:
+    print("🚨 경고: 두 개의 계정 키가 모두 필요합니다. .env를 확인해주세요.")
+    print(f"   - 계정1: {'OK' if APP_KEY_1 else 'MISSING'}")
+    print(f"   - 계정2: {'OK' if APP_KEY_2 else 'MISSING'}")
 
 
 # -----------------------------------------------------------------------------
-# 틱 데이터 처리 핸들러 (KIS WS -> Kafka Producer)
+# 데이터 처리 핸들러 (공통)
 # -----------------------------------------------------------------------------
-def handle_tick(tick_data, producer):
-    """
-    KIS 웹소켓에서 수신한 틱 데이터를 백엔드 DTO 포맷으로 변환하여 Kafka로 전송
-    """
+def handle_tick(data, producer):
     try:
-        # 시간 파싱 (HHMMSS -> ISO Format)
         now = datetime.now()
-        time_str = tick_data.get('stckCntgHour', now.strftime('%H%M%S'))
+        time_str = data.get('time', now.strftime('%H%M%S'))
 
-        # 시간 포맷이 올바른지 확인 후 적용
         if len(time_str) == 6 and time_str.isdigit():
-            dt = now.replace(
-                hour=int(time_str[:2]),
-                minute=int(time_str[2:4]),
-                second=int(time_str[4:6]),
-                microsecond=0
-            )
+            dt = now.replace(hour=int(time_str[:2]), minute=int(time_str[2:4]), second=int(time_str[4:6]))
         else:
             dt = now
 
-        # 백엔드 StockTickDTO 구조에 맞춤
-        payload = {
-            "stockCode": tick_data.get('stckShrnIscd'),
-            "currentPrice": tick_data.get('stckPrpr'),
-            "timestamp": dt.isoformat(),
-            "changeRate": tick_data.get('prdyCtrt', 0.0),
-            "volume": tick_data.get('acmlVol', 0)
-        }
+        timestamp = dt.isoformat()
 
-        # Kafka 전송 (토픽명: stock-ticks)
-        producer.send("stock-ticks", payload)
-        # print(f"[Tick] Sent {payload['stockCode']} : {payload['currentPrice']}")
+        payload = None
+        if data['type'] == 'STOCK_TICK':
+            payload = {
+                "type": "STOCK_TICK",
+                "stockCode": data['stockCode'],
+                "currentPrice": data['currentPrice'],
+                "timestamp": timestamp,
+                "changeRate": data['changeRate'],
+                "volume": data['volume']
+            }
+            # 화면 출력
+            print(f"⚡️ [Tick] {payload['stockCode']} : {payload['currentPrice']}원")
+
+        elif data['type'] == 'ORDER_BOOK':
+            payload = {
+                "type": "ORDER_BOOK",
+                "stockCode": data['stockCode'],
+                "timestamp": timestamp,
+                "asks": data['asks'],
+                "bids": data['bids'],
+                "totalAskQty": data['totalAskQty'],
+                "totalBidQty": data['totalBidQty']
+            }
+
+        if payload:
+            producer.send("stock-ticks", payload)
 
     except Exception as e:
-        print(f"Error sending tick to Kafka: {e}")
+        print(f"Error processing data: {e}")
 
 
 # -----------------------------------------------------------------------------
@@ -77,55 +81,51 @@ def handle_tick(tick_data, producer):
 # -----------------------------------------------------------------------------
 async def main():
     sub_manager = SubscriptionManager()
-
-    # [중요] Kafka Producer 생성 (체결가 전송용)
-    print(f"Connecting to Kafka Broker: {KAFKA_BROKER}")
     kafka_producer = KafkaProducerClient(broker=KAFKA_BROKER)
 
-    # 콜백 함수 정의 (closure로 producer 주입)
+    # 공통 콜백
     on_tick_callback = lambda t: handle_tick(t, kafka_producer)
 
-    # 1. 관리자용 클라이언트 (고정 50개)
-    print("Initialize Admin Client...")
+    # 1. [계정 A] 관리자용 클라이언트 생성
+    print("🔵 Initialize Admin Client (Account 1)...")
     client_admin = KisWSClient(
-        app_key=APP_KEY,
-        app_secret=APP_SECRET,
-        mode="REAL"
+        app_key=APP_KEY_1,
+        app_secret=APP_SECRET_1,
+        mode="VIRTUAL"
     )
-    client_admin.on_tick = on_tick_callback  # 콜백 연결
+    client_admin.on_tick = on_tick_callback
 
-    # 2. 사용자용 클라이언트 (관심 + 조회 종목)
-    print("Initialize User Client...")
+    # 2. [계정 B] 사용자용 클라이언트 생성
+    print("🟢 Initialize User Client (Account 2)...")
     client_user = KisWSClient(
         app_key=APP_KEY_2,
         app_secret=APP_SECRET_2,
-        mode="REAL"
+        mode="VIRTUAL"
     )
-    client_user.on_tick = on_tick_callback  # 콜백 연결
+    client_user.on_tick = on_tick_callback
 
-    # Kafka 소비자 (백엔드 구독 이벤트 수신용)
-    # 토픽명을 백엔드 Producer 설정(subscription-events)과 일치시켜야 함
+    # Kafka 소비자 (구독 명령 수신용)
     kafka_consumer = KafkaConsumerClient(
         broker=KAFKA_BROKER,
         topic="subscription-events",
-        group_id="sc-group-v1"
+        group_id="sc-group-dual-v1"
     )
 
-    # KIS 웹소켓 연결
+    # 두 클라이언트 모두 연결
     await client_admin.connect()
     await client_user.connect()
 
-    # 초기 구독: 관리자 계정 고정 리스트
+    # 3. [계정 A] 고정 종목 50개 구독
     fixed_list = sub_manager.get_fixed_list()
+    fixed_set = set(fixed_list)
     if fixed_list:
-        print(f"Subscribing fixed list ({len(fixed_list)})...")
+        print(f"🔒 [Admin] Subscribing fixed list ({len(fixed_list)} stocks)...")
         await client_admin.subscribe_list(fixed_list)
 
-    print("Stock Collector Started with Dual Accounts & Kafka Pipeline...")
+    print("✅ Stock Collector Started (Dual Client Mode)")
 
     try:
         while True:
-            # Kafka 메시지 폴링 (구독 요청 확인)
             messages = kafka_consumer.poll(timeout=0.1)
 
             for msg in messages:
@@ -133,42 +133,31 @@ async def main():
                     val = msg.value().decode('utf-8')
                     data = json.loads(val)
 
-                    # 백엔드 SubscriptionEventDTO 구조
-                    # { "stockCode": "...", "eventType": "SUBSCRIBE", "subType": "VIEW" ... }
                     stock_code = data.get('stockCode')
-                    event_type = data.get('eventType', 'SUBSCRIBE')
                     sub_type = data.get('subType', 'VIEW')
 
-                    if not stock_code:
+                    if not stock_code: continue
+
+                    # [핵심 로직] 고정 종목에 포함된건지 확인
+                    if stock_code in fixed_set:
                         continue
 
-                    if event_type == 'UNSUBSCRIBE':
-                        # 해지 로직 (필요 시 구현, 여기선 생략하거나 로깅만)
-                        # print(f"Unsubscribe request: {stock_code}")
-                        continue
-
+                    # 고정 리스트에 없다면 -> [계정 B] 사용자 클라이언트로 구독
                     needs_update = False
-
                     if sub_type == 'VIEW':
-                        # 조회용 리스트(Dynamic Queue)에 추가
                         if sub_manager.add_viewing_stock(stock_code):
-                            print(f"[SC] Added VIEW stock: {stock_code}")
+                            print(f"🆕 [User] New VIEW request: {stock_code}")
                             needs_update = True
-
                     elif sub_type == 'INTEREST':
-                        # 관심 종목 리스트에 추가
                         sub_manager.interest_stocks.add(stock_code)
-                        print(f"[SC] Added INTEREST stock: {stock_code}")
+                        print(f"⭐️ [User] New INTEREST request: {stock_code}")
                         needs_update = sub_manager._refresh_user_account_list()
 
-                    # 사용자 계정 구독 리스트 갱신
                     if needs_update:
-                        current_list = sub_manager.get_user_dynamic_list()
-                        print(f"Refreshing User Subscriptions ({len(current_list)} stocks)")
-                        await client_user.subscribe_list(current_list)
+                        await client_user.subscribe(stock_code)  # Now awaitable
 
                 except Exception as e:
-                    print(f"Message Processing Error: {e}")
+                    print(f"Message Error: {e}")
 
             await asyncio.sleep(0.1)
 
@@ -177,7 +166,6 @@ async def main():
         await client_admin.close()
         await client_user.close()
         kafka_consumer.close()
-        # kafka_producer는 별도 close 메서드가 없다면 생략 가능
 
 
 if __name__ == "__main__":
