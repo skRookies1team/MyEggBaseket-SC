@@ -39,16 +39,17 @@ if not APP_KEY_1 or not APP_KEY_2:
 def handle_tick(data, producer):
     try:
         now = datetime.now()
+        # 시간 파싱 (HHmmss -> datetime)
         time_str = data.get('time', now.strftime('%H%M%S'))
-
         if len(time_str) == 6 and time_str.isdigit():
-            dt = now.replace(hour=int(time_str[:2]), minute=int(time_str[2:4]), second=int(time_str[4:6]))
+             dt = now.replace(hour=int(time_str[:2]), minute=int(time_str[2:4]), second=int(time_str[4:6]))
         else:
-            dt = now
-
+             dt = now
         timestamp = dt.isoformat()
 
         payload = None
+
+        # [1] 체결가 데이터 (STOCK_TICK)
         if data['type'] == 'STOCK_TICK':
             payload = {
                 "type": "STOCK_TICK",
@@ -58,20 +59,24 @@ def handle_tick(data, producer):
                 "changeRate": data['changeRate'],
                 "volume": data['volume']
             }
-            # 화면 출력
-            print(f"⚡️ [Tick] {payload['stockCode']} : {payload['currentPrice']}원")
+            # 로그 출력 (선택)
+            # print(f"⚡️ [Tick] {payload['stockCode']} : {payload['currentPrice']}원")
 
+        # [2] 호가 데이터 (ORDER_BOOK) -> Kafka로 전송
         elif data['type'] == 'ORDER_BOOK':
             payload = {
                 "type": "ORDER_BOOK",
                 "stockCode": data['stockCode'],
                 "timestamp": timestamp,
-                "asks": data['asks'],
-                "bids": data['bids'],
+                "asks": data['asks'],         # 매도 호가 리스트
+                "bids": data['bids'],         # 매수 호가 리스트
                 "totalAskQty": data['totalAskQty'],
                 "totalBidQty": data['totalBidQty']
             }
+            # 호가 데이터는 빈도가 높으므로 로그는 생략하거나 필요시 주석 해제
+            # print(f"📊 [OrderBook] {payload['stockCode']}")
 
+        # [3] Kafka 전송 (stock-ticks 토픽 공유)
         if payload:
             producer.send("stock-ticks", payload)
 
